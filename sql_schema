@@ -1,0 +1,68 @@
+CREATE DATABASE qi_app;
+CREATE USER 'Unique_User'@'localhost' IDENTIFIED BY 'Unique_Password';
+GRANT ALL PRIVILEGES ON APP_NAME.* TO 'Unique_User'@'localhost';
+FLUSH PRIVILEGES;
+USE APP_NAME;
+
+-- USERS
+CREATE TABLE users (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  email VARCHAR(255) NOT NULL UNIQUE,
+  password VARCHAR(255) NOT NULL,
+  role ENUM('admin', 'staff', 'client') DEFAULT 'client'
+);
+
+-- CLIENTS
+CREATE TABLE clients (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT,
+  name VARCHAR(255),
+  phone VARCHAR(20),
+  tax_id VARCHAR(50),
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+-- EXCHANGES
+CREATE TABLE exchanges (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  client_id INT,
+  exchange_type ENUM('delayed', 'reverse', 'build-to-suit') DEFAULT 'delayed',
+  start_date DATE,
+  end_date DATE,
+  status ENUM('open', 'completed', 'cancelled') DEFAULT 'open',
+  notes TEXT,
+  FOREIGN KEY (client_id) REFERENCES clients(id)
+);
+
+-- PROPERTIES
+CREATE TABLE properties (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  exchange_id INT,
+  address VARCHAR(255),
+  type ENUM('relinquished', 'replacement'),
+  closing_date DATE,
+  price DECIMAL(15,2),
+  escrow_info VARCHAR(255),
+  FOREIGN KEY (exchange_id) REFERENCES exchanges(id)
+);
+
+-- FUNDS
+CREATE TABLE funds (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  exchange_id INT,
+  amount DECIMAL(15,2),
+  direction ENUM('incoming', 'outgoing'),
+  method ENUM('wire', 'check'),
+  transaction_date DATE,
+  FOREIGN KEY (exchange_id) REFERENCES exchanges(id)
+);
+
+-- DOCUMENTS
+CREATE TABLE documents (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  exchange_id INT,
+  filename VARCHAR(255),
+  url TEXT,
+  uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (exchange_id) REFERENCES exchanges(id)
+);
