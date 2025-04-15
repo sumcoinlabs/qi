@@ -1,61 +1,193 @@
-from flask import Flask, request, jsonify
+# FULL FEATURED app.py for QI Exchange Backend
+
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
-from flask_jwt_extended import JWTManager, create_access_token
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from werkzeug.security import check_password_hash, generate_password_hash
 import mysql.connector
 import datetime
+import os
 
 app = Flask(__name__)
 CORS(app)
 
-app.config['JWT_SECRET_KEY'] = 'super-secret-key'  # for JWT
+# JWT Config
+app.config['JWT_SECRET_KEY'] = 'super-secret-key'  # Replace with secure key in prod
 jwt = JWTManager(app)
 
-# MySQL DB connection
-db = mysql.connector.connect(
-    host="localhost",
-    user="Unique_User",
-    password="Unique_Password",
-    database="Unique_Database"
-)
+# DB Connection Management
+
+def get_db():
+    if 'db' not in g:
+        g.db = mysql.connector.connect(
+            host="localhost",
+            user="qi_user",
+            password="sqlP@ss",
+            database="qi_app"
+        )
+    return g.db
+
+@app.teardown_appcontext
+def close_db(error):
+    db = g.pop('db', None)
+    if db:
+        db.close()
+
+# =================== AUTH ===================
 
 @app.route("/auth/login", methods=["POST"])
 def login():
-    email = request.form.get("email")
-    password = request.form.get("password")
+    data = request.get_json() or request.form
+    email = data.get("email")
+    password = data.get("password")
 
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM users WHERE email = %s AND password = %s", (email, password))
-    user = cursor.fetchone()
+    if not email or not password:
+        return jsonify({"error": "Email and password required."}), 400
 
-    if user:
+    try:
+        cursor = get_db().cursor(dictionary=True)
+        cursor.execute("SELECT * FROM users WHERE email = %s", (email,))
+        user = cursor.fetchone()
+    except:
+        return jsonify({"error": "Database error."}), 500
+
+    if user and check_password_hash(user['password'], password):
+        cursor.execute("UPDATE users SET last_login = NOW() WHERE id = %s", (user['id'],))
+        get_db().commit()
         token = create_access_token(identity=user['id'], expires_delta=datetime.timedelta(days=1))
-        return jsonify({
-            "token": token,
-            "role": user['role'],
-            "email": user['email']
-        })
+        return jsonify({"token": token, "role": user['role'], "email": user['email']})
     else:
         return jsonify({"error": "Invalid credentials"}), 401
 
-# 🔥 New Admin Dashboard Route
-@app.route("/admin/dashboard", methods=["GET"])
-def admin_dashboard():
-    cursor = db.cursor()
+@app.route("/auth/register", methods=["POST"])
+def register():
+    data = request.get_json()
+    email = data.get("email")
+    password = data.get("password")
+    role = data.get("role", "client")
 
-    cursor.execute("SELECT COUNT(*) FROM users")
-    user_count = cursor.fetchone()[0]
+    if not email or not password:
+        return jsonify({"error": "Missing fields."}), 400
 
-    # Ensure 'exchanges' table exists
+    hashed = generate_password_hash(password)
     try:
-        cursor.execute("SELECT COUNT(*) FROM exchanges")
-        exchange_count = cursor.fetchone()[0]
-    except mysql.connector.errors.ProgrammingError:
-        exchange_count = 0  # If table not created yet
+        cursor = get_db().cursor()
+        cursor.execute("INSERT INTO users (email, password, role) VALUES (%s, %s, %s)", (email, hashed, role))
+        get_db().commit()
+        return jsonify({"message": "User registered successfully."})
+    except mysql.connector.IntegrityError:
+        return jsonify({"error": "Email already exists."}), 409
 
-    return jsonify({
-        "users": user_count,
-        "exchanges": exchange_count
-    })
+@app.route("/auth/me", methods=["GET"])
+@jwt_required()
+def get_my_info():
+    user_id = get_jwt_identity()
+    cursor = get_db().cursor(dictionary=True)
+    cursor.execute("SELECT id, email, role, created_at FROM users WHERE id = %s", (user_id,))
+    user = cursor.fetchone()
+    return jsonify(user)
+
+# =================== ADMIN DASHBOARD ===================
+
+@app.route("/admin/dashboard", methods=["GET"])
+@jwt_required()
+def admin_dashboard():
+    user_id = get_jwt_identity()
+    cursor = get_db().cursor(dictionary=True)
+    cursor.execute("SELECT role FROM users WHERE id = %s", (user_id,))
+    role = cursor.fetchone()["role"]
+    if role != 'admin':
+        return jsonify({"error": "Admin access required."}), 403
+
+    cursor.execute("SELECT COUNT(*) AS users FROM users")
+    user_count = cursor.fetchone()['users']
+    cursor.execute("SELECT COUNT(*) AS exchanges FROM exchanges")
+    exchange_count = cursor.fetchone()['exchanges']
+    return jsonify({"users": user_count, "exchanges": exchange_count})
+
+# =================== CLIENT & EXCHANGES ===================
+
+@app.route("/client/info", methods=["GET"])
+@jwt_required()
+def get_client_info():
+    user_id = get_jwt_identity()
+    cursor = get_db().cursor(dictionary=True)
+    cursor.execute("SELECT * FROM clients WHERE user_id = %s", (user_id,))
+    return jsonify(cursor.fetchone())
+
+@app.route("/client/exchanges", methods=["GET"])
+@jwt_required()
+def list_exchanges():
+    user_id = get_jwt_identity()
+    cursor = get_db().cursor(dictionary=True)
+    cursor.execute("SELECT id FROM clients WHERE user_id = %s", (user_id,))
+    client = cursor.fetchone()
+    if not client:
+        return jsonify([])
+    cursor.execute("SELECT * FROM exchanges WHERE client_id = %s", (client['id'],))
+    return jsonify(cursor.fetchall())
+
+@app.route("/client/exchanges", methods=["POST"])
+@jwt_required()
+def create_exchange():
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    cursor = get_db().cursor(dictionary=True)
+    cursor.execute("SELECT id FROM clients WHERE user_id = %s", (user_id,))
+    client = cursor.fetchone()
+    if not client:
+        return jsonify({"error": "Client profile not found."}), 404
+
+    cursor.execute("""
+        INSERT INTO exchanges (client_id, exchange_type, start_date, end_date, status, irs_form_type, intermediary_fee, notes)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    """, (
+        client['id'],
+        data.get('exchange_type'),
+        data.get('start_date'),
+        data.get('end_date'),
+        data.get('status'),
+        data.get('irs_form_type'),
+        data.get('intermediary_fee'),
+        data.get('notes')
+    ))
+    get_db().commit()
+    return jsonify({"message": "Exchange created."})
+
+# =================== QUESTIONNAIRES ===================
+
+@app.route("/client/questionnaire", methods=["POST"])
+@jwt_required()
+def submit_questionnaire():
+    data = request.get_json()
+    exchange_id = data.get("exchange_id")
+    responses = data.get("questionnaire_data")
+
+    cursor = get_db().cursor()
+    cursor.execute("INSERT INTO questionnaire_responses (exchange_id, questionnaire_data) VALUES (%s, %s)",
+                   (exchange_id, str(responses)))
+    get_db().commit()
+    return jsonify({"message": "Questionnaire saved."})
+
+# =================== NOTIFICATIONS ===================
+
+@app.route("/notifications", methods=["GET"])
+@jwt_required()
+def get_notifications():
+    user_id = get_jwt_identity()
+    cursor = get_db().cursor(dictionary=True)
+    cursor.execute("SELECT * FROM notifications WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
+    return jsonify(cursor.fetchall())
+
+@app.route("/notifications/read/<int:note_id>", methods=["PATCH"])
+@jwt_required()
+def mark_notification_read(note_id):
+    user_id = get_jwt_identity()
+    cursor = get_db().cursor()
+    cursor.execute("UPDATE notifications SET is_read = 1 WHERE id = %s AND user_id = %s", (note_id, user_id))
+    get_db().commit()
+    return jsonify({"message": "Marked as read."})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=True)
